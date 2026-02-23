@@ -75,7 +75,10 @@ if(!is.null(timepoint_range)){
 
 # Check for empty timepoints
 if(length(scen_timepoints) == 0){
-  stop("No valid timepoints found. Check data date range and timepoint_range parameter.")
+  message("No valid timepoints in requested range - skipping")
+  return(list(samples = data.frame(), id = data.frame(),
+              R = data.frame(), summary = list(),
+              warnings = NULL, timing = data.frame()))
 }
 
   scenarios <- expand.grid(
@@ -83,16 +86,19 @@ if(length(scen_timepoints) == 0){
   )
 
   res <- pmap(scenarios, \(k) {
+        # Map sequential index to original timepoint number
+        original_tp <- as.integer(names(scen_timepoints)[k])
+
         # Case data
         case_segment <- case_data |>
           filter(date <= scen_timepoints[k])
-        
+
         # Use previous 12 weeks of data for forecast
         case_segment <- case_segment |>
           filter(date > (case_segment$date[nrow(case_segment)] - weeks_inc*7))
-        
+
         print(nrow(case_segment))
-        
+
         # Generation interval
         if(var!=1){
         gen_time <- Gamma(mean=gen_mean*scen_values[var],
@@ -126,7 +132,7 @@ start_runtime <- Sys.time()
                                      rt=rt_opts(future=rt_opts_choice),
                                      stan = stan_opts(samples = 3000,
                                                       return_fit = FALSE,
-                                                      control=list(adapt_delta=0.99,
+                                                      control=list(adapt_delta=adapt_delta,
                                                                    max_treedepth=20)),
                                      forecast = forecast_opts(horizon=14),
                                      verbose = FALSE)
@@ -161,7 +167,7 @@ start_runtime <- Sys.time()
 
         def$samples <- NULL
 
-        res_id <- data.frame(timepoint=k,
+        res_id <- data.frame(timepoint=original_tp,
                              gen_time=names(scen_values)[var],
                              inc_period=names(scen_values)[inc])
 
@@ -183,20 +189,20 @@ start_runtime <- Sys.time()
     samples_scen <- res$samples[[i]] |>
       mutate(model="EpiNow2")
 
-    # Add ID
-    samples_scen$result_list <- i
+    # Use actual timepoint as result_list so split jobs don't collide
+    samples_scen$result_list <- res$id[[i]]$timepoint
 
     # Bind to dataframe
     return(samples_scen)
 
   })
-  
+
   res_id <- lapply(seq_along(res$id), function(i){
     res_id <- res$id[[i]] |>
-      mutate(result_list=i)
+      mutate(result_list = timepoint)
     return(res_id)
   })
-  
+
   res_R <- lapply(seq_along(res$R), function(i) {
     if (is.null(res$R[[i]]) || nrow(res$R[[i]]) == 0) {
       stop(paste("Timepoint", i, "has NULL or empty R samples - model fit likely failed"))
@@ -204,21 +210,21 @@ start_runtime <- Sys.time()
     samples_scen <- res$R[[i]] |>
       mutate(model="EpiNow2")
 
-    # Add ID
-    samples_scen$result_list <- i
+    # Use actual timepoint as result_list so split jobs don't collide
+    samples_scen$result_list <- res$id[[i]]$timepoint
 
     # Bind to dataframe
     return(samples_scen)
 
   })
-  
+
   res_samples <- bind_rows(res_samples) |>
     rename(prediction=value)
-  
+
   res_id <- bind_rows(res_id)
   res_R <- bind_rows(res_R)
   res_timing <- bind_rows(res$timing)
-  
+
   return(list(samples = res_samples,
               id = res_id,
               R = res_R,
@@ -229,8 +235,7 @@ start_runtime <- Sys.time()
 
 
 sim_weightprior <- function(case_data,
-                          var,
-                          inc,
+                          vary,
                           gen_mean_mean,
                           gen_mean_sd,
                           gen_sd_mean,
@@ -250,7 +255,12 @@ sim_weightprior <- function(case_data,
                           weeks_inc=12,
                           rt_opts_choice,
                           weight_prior,
-                          obs_scale){
+                          obs_scale,
+                          timepoint_start=NULL,
+                          timepoint_end=NULL,
+                          adapt_delta=0.99){
+
+  stopifnot(vary %in% c("gt", "inc", "both"))
 
   # Handle missing dates (casestudy data is daily)
   case_data <- fill_missing(
@@ -287,9 +297,25 @@ scen_timepoints <- scen_timepoints[-1]
 
 # Make sure max number of timepoints is 8 to ensure quicker runtime
 if(length(scen_timepoints)>8){scen_timepoints <- scen_timepoints[1:8]}
-  
+
+  # Filter to specified timepoint range if provided
+  all_k <- seq_along(scen_timepoints)
+  if (!is.null(timepoint_start)) {
+    all_k <- all_k[all_k >= timepoint_start]
+  }
+  if (!is.null(timepoint_end)) {
+    all_k <- all_k[all_k <= timepoint_end]
+  }
+
+  if (length(all_k) == 0) {
+    message("No timepoints in requested range - skipping")
+    return(list(samples = data.frame(), id = data.frame(),
+                R = data.frame(), summary = list(),
+                warnings = NULL, timing = data.frame()))
+  }
+
   scenarios <- expand.grid(
-    k = seq_along(scen_timepoints)
+    k = all_k
   )
   
 res <- pmap(scenarios, \(k) {
@@ -303,44 +329,40 @@ res <- pmap(scenarios, \(k) {
         
         print(nrow(case_segment))
         
-        # Generation interval - use natural parameters (shape/rate) to avoid crude conversion
+        # Generation interval
         gen_shape <- gen_mean_mean^2 / gen_sd_mean^2
         gen_rate <- gen_mean_mean / gen_sd_mean^2
 
-        # If shape is very high (>100), use Fixed to avoid numerical issues
         if(gen_shape > 100) {
           gen_time <- Fixed(gen_mean_mean)
-        } else {
-          # Uncertainty on shape/rate (delta method approximation)
+        } else if (vary %in% c("gt", "both")) {
           gen_shape_sd <- gen_shape * sqrt((2*gen_mean_sd/gen_mean_mean)^2 + (2*gen_sd_sd/gen_sd_mean)^2)
           gen_rate_sd <- gen_rate * sqrt((gen_mean_sd/gen_mean_mean)^2 + (2*gen_sd_sd/gen_sd_mean)^2)
           gen_time <- Gamma(shape=Normal(gen_shape, gen_shape_sd),
                             rate=Normal(gen_rate, gen_rate_sd),
                             max=gen_max)
+        } else {
+          gen_time <- Gamma(mean=gen_mean_mean, sd=gen_sd_mean, max=gen_max)
         }
 
-        # Incubation period - use natural parameters (meanlog/sdlog)
-        inc_var <- inc_sd_mean^2
-        inc_meanlog <- log(inc_mean_mean^2 / sqrt(inc_var + inc_mean_mean^2))
-        inc_sdlog <- sqrt(log(1 + inc_var / inc_mean_mean^2))
-        # Uncertainty (approximate)
-        inc_meanlog_sd <- inc_mean_sd / inc_mean_mean
-        inc_sdlog_sd <- inc_sd_sd / (2 * inc_sd_mean)
+        # Incubation period
+        if (vary %in% c("inc", "both")) {
+          inc_var <- inc_sd_mean^2
+          inc_meanlog <- log(inc_mean_mean^2 / sqrt(inc_var + inc_mean_mean^2))
+          inc_sdlog <- sqrt(log(1 + inc_var / inc_mean_mean^2))
+          inc_meanlog_sd <- inc_mean_sd / inc_mean_mean
+          inc_sdlog_sd <- inc_sd_sd / (2 * inc_sd_mean)
+          inc_period <- LogNormal(meanlog=Normal(inc_meanlog, inc_meanlog_sd),
+                                  sdlog=Normal(inc_sdlog, inc_sdlog_sd),
+                                  max=inc_max)
+        } else {
+          inc_period <- LogNormal(mean=inc_mean_mean, sd=inc_sd_mean, max=inc_max)
+        }
 
-        inc_period <- LogNormal(meanlog=Normal(inc_meanlog, inc_meanlog_sd),
-                                sdlog=Normal(inc_sdlog, inc_sdlog_sd),
-                                max=inc_max)
-
+        # Fix reporting delay as a point-estimate PMF (not estimated in Stan).
+        # The study focuses on generation time and incubation period uncertainty.
         if(rep_mean_mean>0) {
-          rep_var <- rep_sd_mean^2
-          rep_meanlog <- log(rep_mean_mean^2 / sqrt(rep_var + rep_mean_mean^2))
-          rep_sdlog <- sqrt(log(1 + rep_var / rep_mean_mean^2))
-          rep_meanlog_sd <- rep_mean_sd / rep_mean_mean
-          rep_sdlog_sd <- rep_sd_sd / (2 * rep_sd_mean)
-
-          reporting_delay <- LogNormal(meanlog=Normal(rep_meanlog, rep_meanlog_sd),
-                                       sdlog=Normal(rep_sdlog, rep_sdlog_sd),
-                                       max=rep_max)
+          reporting_delay <- LogNormal(mean=rep_mean_mean, sd=rep_sd_mean, max=rep_max)
         } else {
           reporting_delay <- Fixed(0)
         }
@@ -356,7 +378,7 @@ start_runtime <- Sys.time()
                                      rt=rt_opts(future=rt_opts_choice),
                                      stan = stan_opts(samples = 3000,
                                                       return_fit = FALSE,
-                                                      control=list(adapt_delta=0.99,
+                                                      control=list(adapt_delta=adapt_delta,
                                                                    max_treedepth=20)),
                                      forecast = forecast_opts(horizon=14),
                                      verbose = FALSE)
@@ -407,8 +429,8 @@ res_samples <- lapply(seq_along(res$samples), function(i) {
   samples_scen <- res$samples[[i]] |>
     mutate(model="EpiNow2")
 
-  # Add ID
-  samples_scen$result_list <- i
+  # Use actual timepoint as result_list so split jobs don't collide
+  samples_scen$result_list <- res$id[[i]]$timepoint
 
   # Bind to dataframe
   return(samples_scen)
@@ -417,7 +439,7 @@ res_samples <- lapply(seq_along(res$samples), function(i) {
 
 res_id <- lapply(seq_along(res$id), function(i){
   res_id <- res$id[[i]] |>
-    mutate(result_list=i)
+    mutate(result_list = timepoint)
   return(res_id)
 })
 
@@ -428,8 +450,8 @@ res_R <- lapply(seq_along(res$R), function(i) {
   samples_scen <- res$R[[i]] |>
     mutate(model="EpiNow2")
 
-  # Add ID
-  samples_scen$result_list <- i
+  # Use actual timepoint as result_list so split jobs don't collide
+  samples_scen$result_list <- res$id[[i]]$timepoint
 
   # Bind to dataframe
   return(samples_scen)
